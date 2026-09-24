@@ -1,13 +1,14 @@
-# drive-mounter — keep a NAS share + local SSD mounted for a Docker media stack
+# drive-mounter — keep a NAS share + local SSDs mounted for a Docker media stack
 
-A per-user macOS LaunchAgent that keeps two mounts alive and self-heals when they drop
-(router/NAS reboot, USB sleep/wake):
+A per-user macOS LaunchAgent that keeps a NAS share and one or more local SSD volumes alive
+and self-heals when they drop (router/NAS reboot, USB sleep/wake):
 
 - **NAS (SMB):** `//$NAS_USER@$NAS_HOST/$NAS_SHARE` → `$NAS_MOUNT`
-- **Local SSD (APFS):** volume `$SSD_VOL` → `$SSD_MOUNT`
+- **Local SSDs (APFS):** each `SSD_VOLUMES` entry, volume name → mountpoint
 
-When either is restored, the containers in `$DEPENDENT_CONTAINERS` are restarted so their
-binds re-attach (OrbStack doesn't re-attach a replaced mount on its own).
+When a mount is restored, only the containers that bind **that** mount are restarted so their
+binds re-attach (OrbStack doesn't re-attach a replaced mount on its own) — a blip on one SSD
+doesn't bounce containers that never touch it.
 
 ## Configuration — where the site-specific values live
 All host/user/share/volume names, the container list, the Keychain item name, and the
@@ -16,8 +17,26 @@ LaunchAgent label live in **`config.env`**, which is **gitignored**. The repo sh
 
 ```sh
 cp config.env.example config.env
-$EDITOR config.env          # set NAS_HOST/NAS_USER/NAS_SHARE, SSD_VOL, containers, etc.
+$EDITOR config.env          # set NAS_HOST/NAS_USER/NAS_SHARE, NAS_CONTAINERS, SSD_VOLUMES, etc.
 ```
+
+Containers are listed **per target**:
+
+```sh
+NAS_CONTAINERS="jellyfin sonarr radarr"     # restarted when the NAS comes back
+
+SSD_VOLUMES=(                               # "diskutil volume name|mountpoint|containers"
+  "FastSSD|/Volumes/FastSSD|jellyfin"
+  "Scratch|/Volumes/Scratch|qbittorrent sabnzbd"
+)
+```
+
+The container field may be empty (watch/remount only). A malformed entry (no volume name or
+mountpoint) is logged and skipped; the others still run. List a container under every target
+it binds — check with `docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' <name>`.
+The older single-SSD form (`SSD_VOL` + `SSD_MOUNT` + `DEPENDENT_CONTAINERS`) still works:
+it's used when `SSD_VOLUMES` is unset, and `DEPENDENT_CONTAINERS` also stands in for
+`NAS_CONTAINERS` when that is unset.
 
 `install.sh` deploys `config.env` next to the script and **generates** the LaunchAgent plist
 from `$HOME` + `AGENT_LABEL` — so nothing in the tree hardcodes your username or paths.
@@ -55,6 +74,12 @@ bash install.sh                                           # deploy + load. Re-ru
   `stat` does a metadata round-trip (allowed by TCC) that still times out on a stale mount.
 - **Respectful retry:** TCP pre-check before any mount; per-target exponential backoff
   (30 s·2ⁿ, cap 600 s, ±20 % jitter); notifications only on state transitions.
+- **Per-target restarts, deduplicated per run.** Each target restarts only its own container
+  list. Restarts are deferred until every target in the run has been reconciled, then each
+  container is restarted **at most once** — so when several targets come back together
+  (two APFS volumes on the same USB disk, or NAS + SSD after a power blip) a shared container
+  is bounced once, after *all* its mounts are back. Log lines carry the target tag
+  (`[NAS]`, `[SSD:Borealis]`); the "restored" notification names the containers restarted.
 
 ## Operate
 ```sh
@@ -69,7 +94,8 @@ launchctl bootout   gui/$(id -u)/$LABEL                                # stop
 security add-generic-password -U -A -s "$KEYCHAIN_SERVICE" -a "$NAS_USER" -w
 ```
 
-State is in `~/Library/Application Support/mount-watchdog/{NAS,SSD}.{status,fail,next}`;
+State is in `~/Library/Application Support/mount-watchdog/{NAS,SSD-<volname>}.{status,fail,next}`
+(e.g. `SSD-Borealis.status`; files from the old single-SSD version, `SSD.*`, are unused);
 logs in `~/Library/Logs/mount-watchdog*.log` (auto-rotated at 5 MB).
 
 ## Tested

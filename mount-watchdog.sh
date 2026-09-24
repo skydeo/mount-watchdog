@@ -1,18 +1,22 @@
 #!/bin/bash
 #
-# mount-watchdog.sh — keep an SMB NAS share and a local SSD mounted for a Docker media stack,
-# and self-heal when either drops (router/NAS reboot, USB sleep/wake).
+# mount-watchdog.sh — keep an SMB NAS share and one or more local SSD volumes mounted for a
+# Docker media stack, and self-heal when any of them drops (router/NAS reboot, USB sleep/wake).
 #
 # Driven by a per-user LaunchAgent on a 60s interval. Each run:
 #   * verifies the NAS SMB mount is present AND responsive (stat probe; `ls` is TCC-blocked),
-#   * verifies the local SSD volume is mounted,
+#   * verifies each configured local SSD volume is mounted,
 #   * remounts whatever is lost, respectfully (TCP pre-check + exponential backoff),
-#   * after a mount is restored, restarts the dependent containers so their binds re-attach,
+#   * after a mount is restored, restarts only the containers that bind THAT mount, so their
+#     binds re-attach — each container at most once per run, after all mounts are settled,
 #   * notifies via Notification Center + logs to ~/Library/Logs/mount-watchdog.log.
 #
-# Site-specific values (NAS host/user/share, SSD volume, container list, etc.) come from
-# config.env next to this script. The NAS password is never here: it lives in the Keychain
-# item named by KEYCHAIN_SERVICE and is read at mount time, passed to AppleScript via env.
+# Site-specific values (NAS host/user/share, SSD volumes, per-target container lists, etc.)
+# come from config.env next to this script. The NAS password is never here: it lives in the
+# Keychain item named by KEYCHAIN_SERVICE and is read at mount time, passed to AppleScript
+# via env.
+#
+# Runs under macOS /bin/bash 3.2: no associative arrays, no mapfile, no ${x,,}.
 #
 set -u
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -24,10 +28,14 @@ if [ ! -f "$CONFIG_FILE" ]; then
   echo "mount-watchdog: missing $CONFIG_FILE (copy config.env.example -> config.env and edit)" >&2
   exit 78   # EX_CONFIG
 fi
+SSD_VOLUMES=()   # pre-declare so `${#SSD_VOLUMES[@]}` is safe under `set -u` if config omits it
 # shellcheck source=/dev/null
 . "$CONFIG_FILE"
 : "${NAS_HOST:?set in config.env}" "${NAS_PORT:?}" "${NAS_USER:?}" "${NAS_SHARE:?}" \
-  "${NAS_MOUNT:?}" "${SSD_VOL:?}" "${SSD_MOUNT:?}" "${DEPENDENT_CONTAINERS:?}" "${KEYCHAIN_SERVICE:?}"
+  "${NAS_MOUNT:?}" "${KEYCHAIN_SERVICE:?}"
+
+# NAS containers: NAS_CONTAINERS, or the legacy global DEPENDENT_CONTAINERS if it's unset.
+NAS_CONTAINERS="${NAS_CONTAINERS-${DEPENDENT_CONTAINERS:-}}"
 
 # ---- behavioral constants ---------------------------------------------------------
 BASE_BACKOFF=30                      # seconds
@@ -71,6 +79,7 @@ with_timeout() {  # with_timeout <seconds> <cmd> [args...]
 }
 
 # --- per-target state (small files under STATE_DIR) -------------------------------
+# <target> is a state key such as NAS or SSD-skydeo.xyz; it's only ever used in filenames.
 state_get() {  # state_get <target> <key> <default>
   local f="$STATE_DIR/$1.$2"
   if [ -f "$f" ]; then cat "$f"; else printf '%s' "$3"; fi
@@ -84,8 +93,8 @@ mark_ok() {  # clear backoff for a target
   state_set "$1" next 0
 }
 
-mark_fail() {  # increment failure count and schedule the next attempt (capped, jittered)
-  local target="$1" fc delay i j
+mark_fail() {  # mark_fail <target> [log-tag] — bump failure count, schedule next try (capped, jittered)
+  local target="$1" tag="${2:-$1}" fc delay i j
   fc=$(state_get "$target" fail 0)
   fc=$((fc + 1))
   delay=$BASE_BACKOFF
@@ -97,7 +106,7 @@ mark_fail() {  # increment failure count and schedule the next attempt (capped, 
   delay=$(( delay + delay * j / 100 ))
   state_set "$target" fail "$fc"
   state_set "$target" next "$(( $(now) + delay ))"
-  log "[$target] attempt failed (fail #$fc); next try in ${delay}s"
+  log "[$tag] attempt failed (fail #$fc); next try in ${delay}s"
 }
 
 due() {  # is the target past its backoff window?
@@ -109,26 +118,107 @@ mounted_at() {  # is something mounted exactly at this path?
   mount | grep -qF " on $1 "
 }
 
+# ---------------------------------------------------------------------------- SSD config
+# SSD_VOLUMES entries are "volname|mountpoint|container container ...". Parsed into
+# parallel indexed arrays (bash 3.2 has no associative arrays).
+SSD_NAMES=(); SSD_MOUNTS=(); SSD_CTRS=()
+
+if [ "${#SSD_VOLUMES[@]}" -eq 0 ] && [ -n "${SSD_VOL:-}" ] && [ -n "${SSD_MOUNT:-}" ]; then
+  # Legacy single-SSD config: SSD_VOL / SSD_MOUNT, restarting DEPENDENT_CONTAINERS.
+  SSD_VOLUMES=("$SSD_VOL|$SSD_MOUNT|${DEPENDENT_CONTAINERS:-}")
+fi
+
+for ((i = 0; i < ${#SSD_VOLUMES[@]}; i++)); do
+  entry="${SSD_VOLUMES[$i]}"
+  vol=""; mnt=""; ctrs=""
+  IFS='|' read -r vol mnt ctrs <<< "$entry"
+  if [ -z "$vol" ] || [ -z "$mnt" ]; then
+    log "[config] skipping malformed SSD_VOLUMES entry #$((i + 1)): '$entry' (need volname|mountpoint|containers)"
+    continue
+  fi
+  SSD_NAMES+=("$vol"); SSD_MOUNTS+=("$mnt"); SSD_CTRS+=("$ctrs")
+done
+unset entry vol mnt ctrs
+
+if [ "${#SSD_NAMES[@]}" -eq 0 ]; then
+  log "[config] no valid SSD volume configured (set SSD_VOLUMES, or legacy SSD_VOL + SSD_MOUNT)"
+  echo "mount-watchdog: no valid SSD volume in $CONFIG_FILE (set SSD_VOLUMES)" >&2
+  exit 78   # EX_CONFIG
+fi
+
 # ---------------------------------------------------------------------------- docker
-restart_dependents() {
-  [ -n "${DEPENDENTS_RESTARTED:-}" ] && return 0   # at most once per run (NAS+SSD may both recover)
-  if [ -z "$DOCKER" ]; then
-    log "[NAS] docker binary not found; skipping container restarts"
-    return 1
-  fi
-  if ! with_timeout 15 "$DOCKER" info >/dev/null 2>&1; then
-    log "[NAS] OrbStack/docker not ready; skipping container restarts"
-    return 1
-  fi
-  local c
-  for c in $DEPENDENT_CONTAINERS; do
-    if with_timeout 60 "$DOCKER" restart "$c" >/dev/null 2>&1; then
-      log "[NAS] restarted container '$c'"
+# Restarts are deferred: targets that recover call queue_recovery, and run_recoveries restarts
+# containers only after every mount has been reconciled. Otherwise a container shared by two
+# targets that recover in the same run (e.g. fetch on Obsidian + Borealis) could be restarted
+# after the first remount but before the second, and dedup would then skip it — leaving its
+# second bind stale.
+REC_TAGS=(); REC_CTRS=(); REC_SUBJ=(); REC_MSG=()
+
+queue_recovery() {  # queue_recovery <tag> <containers> <notify-subtitle> <notify-message-prefix>
+  REC_TAGS+=("$1"); REC_CTRS+=("$2"); REC_SUBJ+=("$3"); REC_MSG+=("$4")
+}
+
+RESTARTED=" "        # space-padded set of containers restarted this run
+DOCKER_READY=""      # "" = not checked yet, 1 = ready, 0 = unavailable (cached for the run)
+RESTART_RESULT=""    # set by restart_containers: human summary for the notification
+
+docker_ready() {  # docker_ready <tag>
+  if [ -z "$DOCKER_READY" ]; then
+    if [ -z "$DOCKER" ]; then
+      log "[$1] docker binary not found; skipping container restarts"
+      DOCKER_READY=0
+    elif ! with_timeout 15 "$DOCKER" info >/dev/null 2>&1; then
+      log "[$1] OrbStack/docker not ready; skipping container restarts"
+      DOCKER_READY=0
     else
-      log "[NAS] could not restart container '$c' (absent or failed)"
+      DOCKER_READY=1
+    fi
+  fi
+  [ "$DOCKER_READY" = 1 ]
+}
+
+restart_containers() {  # restart_containers <tag> <space-separated containers>
+  local tag="$1" list="$2" c done_list="" failed_list=""
+  if [ -z "${list// /}" ]; then
+    RESTART_RESULT="no containers to restart"
+    return 0
+  fi
+  if ! docker_ready "$tag"; then
+    RESTART_RESULT="containers not restarted (docker unavailable)"
+    return 1
+  fi
+  for c in $list; do
+    case "$RESTARTED" in
+      *" $c "*)   # already restarted this run for another target — counts as done
+        log "[$tag] container '$c' already restarted this run"
+        done_list="$done_list $c"
+        continue ;;
+    esac
+    if with_timeout 60 "$DOCKER" restart "$c" >/dev/null 2>&1; then
+      log "[$tag] restarted container '$c'"
+      RESTARTED="$RESTARTED$c "
+      done_list="$done_list $c"
+    else
+      log "[$tag] could not restart container '$c' (absent or failed)"
+      failed_list="$failed_list $c"
     fi
   done
-  DEPENDENTS_RESTARTED=1
+  done_list="${done_list# }"; failed_list="${failed_list# }"
+  if [ -n "$done_list" ]; then
+    RESTART_RESULT="restarted ${done_list// /, }"
+  else
+    RESTART_RESULT="no containers restarted"
+  fi
+  [ -n "$failed_list" ] && RESTART_RESULT="$RESTART_RESULT; failed: ${failed_list// /, }"
+  return 0
+}
+
+run_recoveries() {
+  local i
+  for ((i = 0; i < ${#REC_TAGS[@]}; i++)); do
+    restart_containers "${REC_TAGS[$i]}" "${REC_CTRS[$i]}"
+    notify "${REC_SUBJ[$i]}" "${REC_MSG[$i]}; $RESTART_RESULT."
+  done
 }
 
 # ---------------------------------------------------------------------------- NAS
@@ -173,8 +263,7 @@ reconcile_nas() {
   if nas_healthy; then
     if [ "$prev" = "down" ]; then
       log "[NAS] healthy again at $NAS_MOUNT"
-      restart_dependents
-      notify "NAS restored" "Remounted $NAS_MOUNT; restarted media containers."
+      queue_recovery NAS "$NAS_CONTAINERS" "NAS restored" "Remounted $NAS_MOUNT"
     fi
     mark_ok NAS
     state_set NAS status up
@@ -217,8 +306,7 @@ reconcile_nas() {
     log "[NAS] remounted successfully at $NAS_MOUNT"
     mark_ok NAS
     state_set NAS status up
-    restart_dependents
-    notify "NAS restored" "Remounted $NAS_MOUNT; restarted media containers."
+    queue_recovery NAS "$NAS_CONTAINERS" "NAS restored" "Remounted $NAS_MOUNT"
   else
     log "[NAS] remount did not become healthy (server reachable — possible auth/SMB issue)"
     mark_fail NAS
@@ -226,51 +314,54 @@ reconcile_nas() {
 }
 
 # ---------------------------------------------------------------------------- SSD
-ssd_attached() {
-  with_timeout 10 diskutil info "$SSD_VOL" >/dev/null 2>&1
+ssd_attached() {  # ssd_attached <volname>
+  with_timeout 10 diskutil info "$1" >/dev/null 2>&1
 }
 
-reconcile_ssd() {
-  local prev; prev=$(state_get SSD status unknown)
+reconcile_ssd() {  # reconcile_ssd <volname> <mountpoint> <containers>
+  local vol="$1" mnt="$2" ctrs="$3"
+  local key="SSD-$vol" tag="SSD:$vol"
+  local prev; prev=$(state_get "$key" status unknown)
 
-  if mounted_at "$SSD_MOUNT"; then
+  if mounted_at "$mnt"; then
     if [ "$prev" = "down" ]; then
-      log "[SSD] mounted again at $SSD_MOUNT"
-      restart_dependents
-      notify "SSD restored" "$SSD_MOUNT is mounted again; restarted media containers."
+      log "[$tag] mounted again at $mnt"
+      queue_recovery "$tag" "$ctrs" "SSD restored" "Volume '$vol' is mounted again at $mnt"
     fi
-    mark_ok SSD
-    state_set SSD status up
+    mark_ok "$key"
+    state_set "$key" status up
     return
   fi
 
   if [ "$prev" != "down" ]; then
-    log "[SSD] not mounted at $SSD_MOUNT"
-    state_set SSD status down
+    log "[$tag] not mounted at $mnt"
+    state_set "$key" status down
   fi
 
-  due SSD || return
+  due "$key" || return
 
-  if ! ssd_attached; then
-    log "[SSD] volume '$SSD_VOL' not attached; backing off"
-    [ "$prev" != "down" ] && notify "SSD missing" "Volume '$SSD_VOL' is not attached."
-    mark_fail SSD
+  if ! ssd_attached "$vol"; then
+    log "[$tag] volume '$vol' not attached; backing off"
+    [ "$prev" != "down" ] && notify "SSD missing" "Volume '$vol' is not attached."
+    mark_fail "$key" "$tag"
     return
   fi
 
-  log "[SSD] mounting volume '$SSD_VOL'"
-  if with_timeout 30 diskutil mount "$SSD_VOL" >/dev/null 2>&1 && mounted_at "$SSD_MOUNT"; then
-    log "[SSD] mounted successfully at $SSD_MOUNT"
-    mark_ok SSD
-    state_set SSD status up
-    restart_dependents
-    notify "SSD restored" "$SSD_MOUNT is mounted again; restarted media containers."
+  log "[$tag] mounting volume '$vol'"
+  if with_timeout 30 diskutil mount "$vol" >/dev/null 2>&1 && mounted_at "$mnt"; then
+    log "[$tag] mounted successfully at $mnt"
+    mark_ok "$key"
+    state_set "$key" status up
+    queue_recovery "$tag" "$ctrs" "SSD restored" "Volume '$vol' is mounted again at $mnt"
   else
-    log "[SSD] mount attempt failed"
-    mark_fail SSD
+    log "[$tag] mount attempt failed"
+    mark_fail "$key" "$tag"
   fi
 }
 
 # ---------------------------------------------------------------------------- main
 reconcile_nas
-reconcile_ssd
+for ((i = 0; i < ${#SSD_NAMES[@]}; i++)); do
+  reconcile_ssd "${SSD_NAMES[$i]}" "${SSD_MOUNTS[$i]}" "${SSD_CTRS[$i]}"
+done
+run_recoveries
